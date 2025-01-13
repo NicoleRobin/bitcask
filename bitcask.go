@@ -1,14 +1,15 @@
 package bitcask
 
 import (
+	"context"
 	"fmt"
-	"golang.org/x/xerrors"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/nicolerobin/bitcask/errors"
-	"github.com/nicolerobin/log"
+	"github.com/nicolerobin/zrpc/log"
+	"golang.org/x/xerrors"
 )
 
 type Db struct {
@@ -19,35 +20,25 @@ type Db struct {
 
 // Open open a db
 func Open(path string) (*Db, error) {
-	// # TODO: use file lock to avoid db file open by more than one process
+	ctx := context.Background()
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		log.Error("os.OpenFile() failed, err:%s", err)
-		return nil, err
-	}
-
-	if err != nil {
-		log.Error("file.WriteString() failed, err:%s", err)
-		return nil, err
+		return nil, fmt.Errorf("os.OpenFile() failed, err:%w", err)
 	}
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		log.Error("file.Stat() failed, err:%s", err)
-		return nil, err
+		return nil, fmt.Errorf("file.Stat() failed, err:%w", err)
 	}
-	log.Debug("fileInfo:%+v", fileInfo)
 
 	kvs := make(map[string]string)
 	buf := make([]byte, fileInfo.Size())
-	n, err := file.Read(buf)
+	_, err = file.Read(buf)
 	if err != nil {
 		if !xerrors.Is(err, io.EOF) {
-			log.Error("file.Read() failed, err:%s", err)
-			return nil, err
+			return nil, fmt.Errorf("file.Read() failed, err:%w", err)
 		}
 	}
-	log.Debug("file.Read() success, n:%d", n)
 	pairs := strings.Split(string(buf), "\n")
 	for _, pair := range pairs {
 		if len(pair) == 0 {
@@ -58,7 +49,7 @@ func Open(path string) (*Db, error) {
 		if len(items) == 2 {
 			kvs[items[0]] = kvs[items[1]]
 		} else {
-			log.Warn("unexpected pair:%s", pair)
+			log.Warnf(ctx, "unexpected pair:%s", pair)
 		}
 	}
 
@@ -87,12 +78,10 @@ func (db *Db) Delete(key string) {
 
 func (db *Db) Close() error {
 	for k, v := range db.kvs {
-		n, err := db.file.WriteString(fmt.Sprintf("%s,%s\n", k, v))
+		_, err := db.file.WriteString(fmt.Sprintf("%s,%s\n", k, v))
 		if err != nil {
-			log.Error("db.file.WriteString() failed, err:%s", err)
-			return err
+			return fmt.Errorf("db.file.WriteString() failed, err:%w", err)
 		}
-		log.Debug("db.file.WriteString() success, n:%d", n)
 	}
 	return db.file.Close()
 }
