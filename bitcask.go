@@ -18,9 +18,7 @@ type Db struct {
 	kvs  map[string]string
 }
 
-// Open open a db
-func Open(path string) (*Db, error) {
-	ctx := context.Background()
+func Open(ctx context.Context, path string) (*Db, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("os.OpenFile() failed, err:%w", err)
@@ -60,20 +58,24 @@ func Open(path string) (*Db, error) {
 	}, nil
 }
 
-func (db *Db) Set(key, val string) error {
+func (db *Db) Set(ctx context.Context, key, val string) error {
 	db.kvs[key] = val
 	return nil
 }
 
-func (db *Db) Get(key string) (string, error) {
+func (db *Db) Get(ctx context.Context, key string) (string, error) {
 	if val, ok := db.kvs[key]; ok {
 		return val, nil
 	}
 	return "", errors.ErrNotFound
 }
 
-func (db *Db) Delete(key string) {
+func (db *Db) Delete(ctx context.Context, key string) {
 	delete(db.kvs, key)
+}
+
+func (db *Db) Sync(ctx context.Context) error {
+	return nil
 }
 
 func (db *Db) Close() error {

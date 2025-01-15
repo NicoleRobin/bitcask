@@ -14,17 +14,17 @@ func main() {
 	key := "key"
 	val := "value01"
 
-	db, err := bitcask.Open("./test.db")
+	db, err := bitcask.Open(ctx, "./test.db")
 	if err != nil {
 		log.Error(ctx, "bitcask.Open() failed", zap.Error(err))
 	}
 
-	err = db.Set(key, val)
+	err = db.Set(ctx, key, val)
 	if err != nil {
 		log.Error(ctx, "db.Set() failed", zap.Error(err))
 	}
 
-	v, err := db.Get(key)
+	v, err := db.Get(ctx, key)
 	if err != nil {
 		log.Error(ctx, "db.Get() failed", zap.String("key", key), zap.Error(err))
 	}
