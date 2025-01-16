@@ -2,88 +2,155 @@ package bitcask
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
-	"strings"
+	"path"
+	"sync"
+	"time"
 
 	"github.com/nicolerobin/bitcask/errors"
-	"github.com/nicolerobin/zrpc/log"
-	"golang.org/x/xerrors"
 )
 
-type Db struct {
-	path string
-	file *os.File
-	kvs  map[string]string
+type BitCask struct {
+	directory  string
+	index      map[string]indexEntry
+	activeFile *os.File
+	indexFile  *os.File
+	mu         sync.Mutex
+	kvs        map[string]string
 }
 
-func Open(ctx context.Context, path string) (*Db, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("os.OpenFile() failed, err:%w", err)
+func NewBitCask(directory string) (*BitCask, error) {
+	bitCask := &BitCask{
+		directory: directory,
+		index:     make(map[string]indexEntry),
 	}
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("file.Stat() failed, err:%w", err)
+	if err := bitCask.loadIndex(); err != nil {
+		return nil, err
 	}
-
-	kvs := make(map[string]string)
-	buf := make([]byte, fileInfo.Size())
-	_, err = file.Read(buf)
-	if err != nil {
-		if !xerrors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("file.Read() failed, err:%w", err)
-		}
-	}
-	pairs := strings.Split(string(buf), "\n")
-	for _, pair := range pairs {
-		if len(pair) == 0 {
-			continue
-		}
-
-		items := strings.Split(pair, ",")
-		if len(items) == 2 {
-			kvs[items[0]] = kvs[items[1]]
-		} else {
-			log.Warnf(ctx, "unexpected pair:%s", pair)
-		}
-	}
-
-	return &Db{
-		path: path,
-		file: file,
-		kvs:  kvs,
-	}, nil
+	return bitCask, nil
 }
 
-func (db *Db) Set(ctx context.Context, key, val string) error {
-	db.kvs[key] = val
+func (b *BitCask) loadIndex() error {
+	file, err := os.OpenFile(b.getIndexFilePath(), os.O_RDONLY, 0644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+	for {
+		key, offset, size, err := b.readIndexEntry(file)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+		b.index[key] = indexEntry{fileID: 0, offset: offset, size: size}
+	}
 	return nil
 }
 
-func (db *Db) Get(ctx context.Context, key string) (string, error) {
-	if val, ok := db.kvs[key]; ok {
-		return val, nil
+func (b *BitCask) getIndexFilePath() string {
+	return path.Join(b.directory, IndexFileName)
+}
+
+func (b *BitCask) getActiveFilePath() string {
+	return path.Join(b.directory, DataFileName)
+}
+
+func (b *BitCask) readIndexEntry(file *os.File) (string, int64, int64, error) {
+	var keyLen int32
+	if err := binary.Read(file, binary.BigEndian, &keyLen); err != nil {
+		return "", 0, 0, err
 	}
-	return "", errors.ErrNotFound
+	keyBytes := make([]byte, keyLen)
+	if _, err := file.Read(keyBytes); err != nil {
+		return "", 0, 0, err
+	}
+	var fileID, offset, size int64
+	if err := binary.Read(file, binary.BigEndian, &fileID); err != nil {
+		return "", 0, 0, err
+	}
+	if err := binary.Read(file, binary.BigEndian, &offset); err != nil {
+		return "", 0, 0, err
+	}
+	if err := binary.Read(file, binary.BigEndian, &size); err != nil {
+		return "", 0, 0, err
+	}
+	return string(keyBytes), offset, size, nil
 }
 
-func (db *Db) Delete(ctx context.Context, key string) {
-	delete(db.kvs, key)
-}
-
-func (db *Db) Sync(ctx context.Context) error {
+func (b *BitCask) writeIndexEntry(ctx context.Context, key string, fileID int, offset, size int64) error {
+	file, err := os.OpenFile(b.getIndexFilePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	keyBytes := []byte(key)
+	keyLen := int32(len(keyBytes))
+	binary.Write(file, binary.BigEndian, keyLen)
+	file.Write(keyBytes)
+	binary.Write(file, binary.BigEndian, int64(fileID))
+	binary.Write(file, binary.BigEndian, offset)
+	binary.Write(file, binary.BigEndian, size)
 	return nil
 }
 
-func (db *Db) Close() error {
-	for k, v := range db.kvs {
-		_, err := db.file.WriteString(fmt.Sprintf("%s,%s\n", k, v))
+func (b *BitCask) Set(ctx context.Context, key, value string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeFile == nil {
+		var err error
+		b.activeFile, err = os.OpenFile(b.getActiveFilePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			return fmt.Errorf("db.file.WriteString() failed, err:%w", err)
+			return err
 		}
 	}
-	return db.file.Close()
+	timestamp := time.Now().UnixNano()
+	entry := struct {
+		Timestamp int64
+		KeyLen    int32
+		ValueLen  int32
+	}{
+		Timestamp: timestamp,
+		KeyLen:    int32(len(key)),
+		ValueLen:  int32(len(value)),
+	}
+	if err := binary.Write(b.activeFile, binary.BigEndian, entry); err != nil {
+		return err
+	}
+	if _, err := b.activeFile.Write([]byte(key)); err != nil {
+		return err
+	}
+	if _, err := b.activeFile.Write([]byte(value)); err != nil {
+		return err
+	}
+	offset, err := b.activeFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("file.Seek() failed, err:%w", err)
+	}
+
+	offset = offset - int64(binary.Size(entry)) - int64(len(key)) - int64(len(value))
+	size := int64(binary.Size(entry)) + int64(len(key)) + int64(len(value))
+	b.index[key] = indexEntry{fileID: 0, offset: offset, size: size}
+	return b.writeIndexEntry(ctx, key, 0, offset, size)
+}
+
+func (b *BitCask) Get(ctx context.Context, key string) (string, error) {
+	if _, ok := b.index[key]; !ok {
+		return "", errors.ErrNotFound
+	}
+
+	return "", nil
+}
+
+func (b *BitCask) Delete(ctx context.Context, key string) {
+}
+
+func (b *BitCask) Close() error {
+	return nil
 }
